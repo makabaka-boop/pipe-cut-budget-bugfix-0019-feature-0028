@@ -1,0 +1,16 @@
+# Build artifacts
+/bin/
+/dist/
+/server
+/verify
+*.exe
+*.test
+*.out
+coverage.*
+
+# Local environment overrides
+.env
+
+# OS / editor noise
+.DS_Store
+*.swp

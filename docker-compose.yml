@@ -1,0 +1,30 @@
+services:
+  api:
+    build:
+      context: .
+      target: runtime
+    image: raincut-api
+    environment:
+      PORT: "8080"
+      SHUTDOWN_TIMEOUT: "15s"
+    # Keep this above SHUTDOWN_TIMEOUT so active requests can complete; if the
+    # application cannot drain within 15s, it exits non-zero before SIGKILL.
+    stop_grace_period: 20s
+    ports:
+      # API_PORT selects the host port (default 8080).
+      - "${API_PORT:-8080}:8080"
+    restart: unless-stopped
+
+  # One-shot acceptance service: runs `go test ./...` and then the live
+  # black-box checks against the api service, and exits.
+  verify:
+    build:
+      context: .
+      target: verify
+    image: raincut-verify
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      API_URL: http://api:8080
+    restart: "no"
