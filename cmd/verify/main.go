@@ -4,7 +4,10 @@
 // exact shutdown costs for parallel edges, self-loops and multi-source /
 // multi-sink graphs, a stable 422 error envelope for invalid graphs, and a
 // 20000-node / 100000-edge graph whose exact cost must be returned within a
-// 10 second request timeout.
+// 10 second request timeout. It also accepts the contamination-survey API:
+// target derivation, the PENDING/IN_PROGRESS/COMPLETED lifecycle, the
+// conclusion, the 404/409/422 error envelope, and concurrent sampling where
+// records must be complete, duplicate-free and concluded exactly once.
 //
 // The API base URL is read from API_URL (default http://localhost:8080).
 package main
@@ -13,9 +16,11 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/rand"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 )
 
@@ -112,6 +117,20 @@ func main() {
 	fmt.Println("== 20000 nodes / 100000 edges within a 10s request timeout ==")
 	checkLarge()
 
+	fmt.Println("== investigations: targets, lifecycle, conclusion ==")
+	checkInvestigationTargets()
+	checkInvestigationLifecycle()
+	checkInvestigationCleanConclusion()
+	checkInvestigationNoTargets()
+
+	fmt.Println("== investigations: stable error envelope (422 / 404 / 409) ==")
+	checkInvestigationInvalidCreates()
+	checkInvestigationSampleErrors()
+
+	fmt.Println("== investigations: concurrent sampling ==")
+	checkInvestigationConcurrentTargets()
+	checkInvestigationConcurrentLastTarget()
+
 	fmt.Println()
 	if failures > 0 {
 		fmt.Printf("VERIFY FAILED: %d check(s) failed\n", failures)
@@ -140,27 +159,41 @@ func waitReady() {
 	}
 }
 
-// post sends body to the endpoint with the given timeout and returns the
-// status code plus the decoded JSON document.
-func post(timeout time.Duration, body []byte) (int, map[string]json.RawMessage, time.Duration, error) {
+// doPost sends body to path with the given timeout and returns the status
+// code plus the raw response body.
+func doPost(path string, timeout time.Duration, body []byte) (int, []byte, time.Duration, error) {
 	client := &http.Client{Timeout: timeout}
 	start := time.Now()
-	resp, err := http.NewRequest(http.MethodPost, apiURL+"/minimum-shutdown-cost", bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, apiURL+path, bytes.NewReader(body))
 	if err != nil {
 		return 0, nil, 0, err
 	}
-	resp.Header.Set("Content-Type", "application/json")
-	res, err := client.Do(resp)
+	req.Header.Set("Content-Type", "application/json")
+	res, err := client.Do(req)
 	elapsed := time.Since(start)
 	if err != nil {
 		return 0, nil, elapsed, err
 	}
 	defer res.Body.Close()
-	var doc map[string]json.RawMessage
-	if err := json.NewDecoder(res.Body).Decode(&doc); err != nil {
-		return res.StatusCode, nil, elapsed, fmt.Errorf("response is not JSON: %w", err)
+	raw, err := io.ReadAll(res.Body)
+	if err != nil {
+		return res.StatusCode, nil, elapsed, fmt.Errorf("read body: %w", err)
 	}
-	return res.StatusCode, doc, elapsed, nil
+	return res.StatusCode, raw, elapsed, nil
+}
+
+// post sends body to the minimum-shutdown-cost endpoint with the given
+// timeout and returns the status code plus the decoded JSON document.
+func post(timeout time.Duration, body []byte) (int, map[string]json.RawMessage, time.Duration, error) {
+	status, raw, elapsed, err := doPost("/minimum-shutdown-cost", timeout, body)
+	if err != nil {
+		return 0, nil, elapsed, err
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return status, nil, elapsed, fmt.Errorf("response is not JSON: %w", err)
+	}
+	return status, doc, elapsed, nil
 }
 
 func checkExact(name string, req graphRequest, want int64) {
@@ -366,4 +399,542 @@ func pass(msg string) {
 func record(name string, err error) {
 	failures++
 	fmt.Printf("  FAIL  %s: %v\n", name, err)
+}
+
+// ---------------------------------------------------------------------------
+// Contamination survey (investigations) acceptance
+// ---------------------------------------------------------------------------
+
+type invSample struct {
+	SampleID string `json:"sample_id"`
+	Node     int64  `json:"node"`
+	Result   string `json:"result"`
+}
+
+// invView is the full investigation document returned by the API.
+type invView struct {
+	ID         string `json:"id"`
+	Status     string `json:"status"`
+	Conclusion string `json:"conclusion"`
+	Snapshot   struct {
+		N     int64 `json:"n"`
+		Edges []struct {
+			From int64 `json:"from"`
+			To   int64 `json:"to"`
+		} `json:"edges"`
+		Inlets []int64 `json:"inlets"`
+	} `json:"snapshot"`
+	Targets   []int64     `json:"targets"`
+	Samples   []invSample `json:"samples"`
+	CreatedAt string      `json:"created_at"`
+}
+
+// createInvestigation posts body to /investigations and expects 201 plus a
+// full investigation view.
+func createInvestigation(body []byte) (invView, error) {
+	status, raw, _, err := doPost("/investigations", 10*time.Second, body)
+	if err != nil {
+		return invView{}, err
+	}
+	if status != http.StatusCreated {
+		return invView{}, fmt.Errorf("create status = %d, want 201 (body %s)", status, raw)
+	}
+	var view invView
+	if err := json.Unmarshal(raw, &view); err != nil {
+		return invView{}, fmt.Errorf("create response is not an investigation view: %w", err)
+	}
+	if view.ID == "" || view.Status == "" || view.CreatedAt == "" {
+		return invView{}, fmt.Errorf("create view misses id/status/created_at: %s", raw)
+	}
+	if view.Targets == nil || view.Samples == nil {
+		return invView{}, fmt.Errorf("targets and samples must be arrays, got %s", raw)
+	}
+	return view, nil
+}
+
+// postSample posts one sample document and returns the status, the decoded
+// view when the status is 200, and the raw body otherwise.
+func postSample(id string, body []byte) (int, invView, []byte, error) {
+	status, raw, _, err := doPost("/investigations/"+id+"/samples", 10*time.Second, body)
+	if err != nil {
+		return 0, invView{}, nil, err
+	}
+	if status != http.StatusOK {
+		return status, invView{}, raw, nil
+	}
+	var view invView
+	if err := json.Unmarshal(raw, &view); err != nil {
+		return status, invView{}, raw, fmt.Errorf("sample response is not an investigation view: %w", err)
+	}
+	return status, view, raw, nil
+}
+
+func sampleBody(sampleID string, node int64, result string) []byte {
+	body, _ := json.Marshal(invSample{SampleID: sampleID, Node: node, Result: result})
+	return body
+}
+
+func sameNodes(got []int64, want ...int64) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// checkInvestigationTargets verifies the reachable-target derivation against
+// a graph full of traps: parallel edges, self-loops, a cycle back into an
+// inlet, an inlet reachable from another inlet, and a disconnected component.
+func checkInvestigationTargets() {
+	name := "targets exclude inlets and ignore cycles/self-loops/parallel edges"
+	view, err := createInvestigation([]byte(`{
+		"n": 6,
+		"edges": [
+			{"from":0,"to":2},{"from":0,"to":2},
+			{"from":2,"to":3},{"from":3,"to":0},
+			{"from":1,"to":3},{"from":3,"to":3},
+			{"from":0,"to":0},{"from":5,"to":4}
+		],
+		"inlets": [0,1]
+	}`))
+	if err != nil {
+		record(name, err)
+		return
+	}
+	switch {
+	case !sameNodes(view.Targets, 2, 3):
+		record(name, fmt.Errorf("targets = %v, want [2 3]", view.Targets))
+	case view.Status != "PENDING":
+		record(name, fmt.Errorf("status = %s, want PENDING", view.Status))
+	case view.Conclusion != "clean":
+		record(name, fmt.Errorf("conclusion = %s, want clean", view.Conclusion))
+	case len(view.Samples) != 0:
+		record(name, fmt.Errorf("samples = %v, want none", view.Samples))
+	case view.Snapshot.N != 6 || len(view.Snapshot.Edges) != 8 || !sameNodes(view.Snapshot.Inlets, 0, 1):
+		record(name, fmt.Errorf("snapshot mismatch: %+v", view.Snapshot))
+	default:
+		pass(fmt.Sprintf("%s (targets=%v)", name, view.Targets))
+	}
+}
+
+// checkInvestigationLifecycle walks one investigation through
+// PENDING -> IN_PROGRESS -> COMPLETED, checks the contaminated conclusion and
+// that the terminal state rejects further writes.
+func checkInvestigationLifecycle() {
+	view, err := createInvestigation([]byte(
+		`{"n":4,"edges":[{"from":0,"to":1},{"from":1,"to":2}],"inlets":[0]}`))
+	if err != nil {
+		record("lifecycle: create", err)
+		return
+	}
+	id := view.ID
+
+	status, view, raw, err := postSample(id, sampleBody("life-1", 1, "clean"))
+	switch {
+	case err != nil:
+		record("lifecycle: first sample", err)
+		return
+	case status != http.StatusOK:
+		record("lifecycle: first sample", fmt.Errorf("status = %d, want 200 (body %s)", status, raw))
+		return
+	case view.Status != "IN_PROGRESS" || view.Conclusion != "clean" || len(view.Samples) != 1:
+		record("lifecycle: first sample", fmt.Errorf("view = %+v, want IN_PROGRESS/clean/1 sample", view))
+		return
+	}
+
+	status, view, raw, err = postSample(id, sampleBody("life-2", 2, "contaminated"))
+	switch {
+	case err != nil:
+		record("lifecycle: completing sample", err)
+		return
+	case status != http.StatusOK:
+		record("lifecycle: completing sample", fmt.Errorf("status = %d, want 200 (body %s)", status, raw))
+		return
+	case view.Status != "COMPLETED":
+		record("lifecycle: completing sample", fmt.Errorf("status = %s, want COMPLETED", view.Status))
+		return
+	case view.Conclusion != "contaminated":
+		record("lifecycle: completing sample", fmt.Errorf("conclusion = %s, want contaminated", view.Conclusion))
+		return
+	case len(view.Samples) != 2:
+		record("lifecycle: completing sample", fmt.Errorf("samples = %d, want 2", len(view.Samples)))
+		return
+	}
+
+	status, raw, _, err = doPost("/investigations/"+id+"/samples", 10*time.Second, sampleBody("life-3", 1, "clean"))
+	switch {
+	case err != nil:
+		record("lifecycle: terminal write", err)
+		return
+	case status != http.StatusConflict:
+		record("lifecycle: terminal write", fmt.Errorf("status = %d, want 409 (body %s)", status, raw))
+		return
+	}
+	pass("lifecycle PENDING -> IN_PROGRESS -> COMPLETED, conclusion contaminated, terminal write -> 409")
+}
+
+// checkInvestigationCleanConclusion: all-clean samples conclude clean.
+func checkInvestigationCleanConclusion() {
+	name := "all-clean samples conclude clean"
+	view, err := createInvestigation([]byte(
+		`{"n":3,"edges":[{"from":0,"to":1},{"from":1,"to":2}],"inlets":[0]}`))
+	if err != nil {
+		record(name, err)
+		return
+	}
+	if _, _, _, err := postSample(view.ID, sampleBody("clean-1", 1, "clean")); err != nil {
+		record(name, err)
+		return
+	}
+	_, view, _, err = postSample(view.ID, sampleBody("clean-2", 2, "clean"))
+	switch {
+	case err != nil:
+		record(name, err)
+	case view.Status != "COMPLETED" || view.Conclusion != "clean":
+		record(name, fmt.Errorf("got (%s, %s), want (COMPLETED, clean)", view.Status, view.Conclusion))
+	default:
+		pass(name)
+	}
+}
+
+// checkInvestigationNoTargets: an investigation without reachable targets is
+// COMPLETED at creation and stays terminal.
+func checkInvestigationNoTargets() {
+	name := "no targets completes at creation"
+	view, err := createInvestigation([]byte(
+		`{"n":2,"edges":[{"from":0,"to":0}],"inlets":[0]}`))
+	if err != nil {
+		record(name, err)
+		return
+	}
+	switch {
+	case view.Status != "COMPLETED":
+		record(name, fmt.Errorf("status = %s, want COMPLETED", view.Status))
+		return
+	case len(view.Targets) != 0:
+		record(name, fmt.Errorf("targets = %v, want none", view.Targets))
+		return
+	case view.Conclusion != "clean":
+		record(name, fmt.Errorf("conclusion = %s, want clean", view.Conclusion))
+		return
+	}
+	status, raw, _, err := doPost("/investigations/"+view.ID+"/samples", 10*time.Second,
+		sampleBody("none-1", 0, "clean"))
+	switch {
+	case err != nil:
+		record(name, err)
+	case status != http.StatusConflict:
+		record(name, fmt.Errorf("terminal write status = %d, want 409 (body %s)", status, raw))
+	default:
+		pass(name + "; terminal write -> 409")
+	}
+}
+
+// checkInvestigationInvalidCreates: invalid snapshots are rejected with 422
+// and the stable error envelope.
+func checkInvestigationInvalidCreates() {
+	cases := []struct {
+		name string
+		body []byte
+	}{
+		{"n zero", []byte(`{"n":0,"edges":[],"inlets":[0]}`)},
+		{"n above maximum", []byte(`{"n":20001,"edges":[],"inlets":[0]}`)},
+		{"edge endpoint out of range", []byte(`{"n":2,"edges":[{"from":0,"to":2}],"inlets":[0]}`)},
+		{"negative edge endpoint", []byte(`{"n":2,"edges":[{"from":-1,"to":1}],"inlets":[0]}`)},
+		{"empty inlets", []byte(`{"n":2,"edges":[],"inlets":[]}`)},
+		{"inlet out of range", []byte(`{"n":2,"edges":[],"inlets":[2]}`)},
+		{"unknown field", []byte(`{"n":2,"edges":[],"inlets":[0],"debug":true}`)},
+		{"malformed json", []byte(`{"n":2,"edges":[`)},
+	}
+	for _, tc := range cases {
+		status, raw, _, err := doPost("/investigations", 10*time.Second, tc.body)
+		switch {
+		case err != nil:
+			record("invalid create: "+tc.name, err)
+		case status != http.StatusUnprocessableEntity:
+			record("invalid create: "+tc.name, fmt.Errorf("status = %d, want 422 (body %s)", status, raw))
+		default:
+			var doc map[string]json.RawMessage
+			if err := json.Unmarshal(raw, &doc); err != nil || envelopeShape(doc) == "" {
+				record("invalid create: "+tc.name, fmt.Errorf("missing error envelope in %s", raw))
+			} else {
+				pass(fmt.Sprintf("invalid create: %s -> 422 %s", tc.name, envelopeShape(doc)))
+			}
+		}
+	}
+}
+
+// checkInvestigationSampleErrors: unknown investigations answer 404, invalid
+// sample documents 422, and conflicts 409, all with the stable envelope; the
+// rejected writes must leave no trace.
+func checkInvestigationSampleErrors() {
+	view, err := createInvestigation([]byte(
+		`{"n":5,"edges":[{"from":0,"to":1},{"from":0,"to":2}],"inlets":[0]}`))
+	if err != nil {
+		record("sample errors: create", err)
+		return
+	}
+	id := view.ID
+
+	expectEnvelope := func(name string, wantStatus int, body []byte) bool {
+		status, raw, _, err := doPost("/investigations/"+id+"/samples", 10*time.Second, body)
+		if err != nil {
+			record(name, err)
+			return false
+		}
+		if status != wantStatus {
+			record(name, fmt.Errorf("status = %d, want %d (body %s)", status, wantStatus, raw))
+			return false
+		}
+		var doc map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &doc); err != nil || envelopeShape(doc) == "" {
+			record(name, fmt.Errorf("missing error envelope in %s", raw))
+			return false
+		}
+		return true
+	}
+
+	// Unknown investigation -> 404.
+	status, raw, _, err := doPost("/investigations/999999/samples", 10*time.Second, sampleBody("ghost", 1, "clean"))
+	switch {
+	case err != nil:
+		record("sample errors: unknown investigation", err)
+	case status != http.StatusNotFound:
+		record("sample errors: unknown investigation", fmt.Errorf("status = %d, want 404 (body %s)", status, raw))
+	default:
+		var doc map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &doc); err != nil || envelopeShape(doc) == "" {
+			record("sample errors: unknown investigation", fmt.Errorf("missing error envelope in %s", raw))
+		} else {
+			pass("sample errors: unknown investigation -> 404 " + envelopeShape(doc))
+		}
+	}
+
+	// Invalid sample documents -> 422.
+	invalid := []struct {
+		name string
+		body []byte
+	}{
+		{"empty sample_id", sampleBody("", 1, "clean")},
+		{"missing node", []byte(`{"sample_id":"x","result":"clean"}`)},
+		{"negative node", sampleBody("x", -1, "clean")},
+		{"unknown result", sampleBody("x", 1, "murky")},
+		{"malformed json", []byte(`{"sample_id":"x",`)},
+	}
+	for _, tc := range invalid {
+		if expectEnvelope("sample errors: "+tc.name, http.StatusUnprocessableEntity, tc.body) {
+			pass(fmt.Sprintf("sample errors: %s -> 422", tc.name))
+		}
+	}
+
+	// Conflicts -> 409.
+	if _, _, _, err := postSample(id, sampleBody("taken", 1, "clean")); err != nil {
+		record("sample errors: seed sample", err)
+		return
+	}
+	conflicts := []struct {
+		name string
+		body []byte
+	}{
+		{"duplicate sample_id", sampleBody("taken", 2, "clean")},
+		{"node already sampled", sampleBody("fresh", 1, "clean")},
+		{"node not a target", sampleBody("other", 3, "clean")},
+		{"node out of range", sampleBody("other2", 99, "clean")},
+		{"inlet is not a target", sampleBody("other3", 0, "clean")},
+	}
+	for _, tc := range conflicts {
+		if expectEnvelope("sample errors: "+tc.name, http.StatusConflict, tc.body) {
+			pass(fmt.Sprintf("sample errors: %s -> 409", tc.name))
+		}
+	}
+
+	// None of the rejected writes may have left a trace: the investigation
+	// completes with exactly the two valid samples.
+	_, view, _, err = postSample(id, sampleBody("final", 2, "clean"))
+	switch {
+	case err != nil:
+		record("sample errors: no trace", err)
+	case view.Status != "COMPLETED" || len(view.Samples) != 2:
+		record("sample errors: no trace", fmt.Errorf("view = %+v, want COMPLETED with exactly 2 samples", view))
+	default:
+		pass("sample errors: rejected writes left no trace")
+	}
+}
+
+// checkInvestigationConcurrentTargets fires one sample per target plus
+// duplicate impostors at one investigation concurrently: exactly one sample
+// per target may be recorded and the investigation must conclude exactly
+// once.
+func checkInvestigationConcurrentTargets() {
+	name := "concurrent samples on distinct targets"
+	const targets = 40
+	edges := make([]map[string]int64, 0, targets)
+	for i := 0; i < targets; i++ {
+		edges = append(edges, map[string]int64{"from": int64(i), "to": int64(i + 1)})
+	}
+	createBody, _ := json.Marshal(map[string]any{"n": targets + 1, "edges": edges, "inlets": []int64{0}})
+	view, err := createInvestigation(createBody)
+	if err != nil {
+		record(name, err)
+		return
+	}
+	if len(view.Targets) != targets {
+		record(name, fmt.Errorf("targets = %d, want %d", len(view.Targets), targets))
+		return
+	}
+
+	type outcome struct {
+		status int
+		view   invView
+	}
+	const extras = 6
+	results := make(chan outcome, targets+extras)
+	var wg sync.WaitGroup
+	fire := func(body []byte) {
+		defer wg.Done()
+		status, raw, _, err := doPost("/investigations/"+view.ID+"/samples", 10*time.Second, body)
+		if err != nil {
+			record(name, err)
+			results <- outcome{status: -1}
+			return
+		}
+		var v invView
+		if status == http.StatusOK {
+			if err := json.Unmarshal(raw, &v); err != nil {
+				record(name, fmt.Errorf("bad success view: %w", err))
+			}
+		}
+		results <- outcome{status: status, view: v}
+	}
+	for node := int64(1); node <= targets; node++ {
+		result := "clean"
+		if node == 20 {
+			result = "contaminated"
+		}
+		sample := sampleBody(fmt.Sprintf("c-%d", node), node, result)
+		wg.Add(1)
+		go fire(sample)
+	}
+	// Exact duplicates of one sample and node-duplicates of another: every
+	// one of them must lose against the original.
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go fire(sampleBody("c-5", 5, "clean"))
+		wg.Add(1)
+		go fire(sampleBody(fmt.Sprintf("impostor-%d", i), 7, "clean"))
+	}
+	wg.Wait()
+	close(results)
+
+	var ok, conflict, other, completedViews int
+	var final invView
+	for out := range results {
+		switch out.status {
+		case http.StatusOK:
+			ok++
+			if out.view.Status == "COMPLETED" {
+				completedViews++
+				final = out.view
+			}
+		case http.StatusConflict:
+			conflict++
+		default:
+			other++
+		}
+	}
+	switch {
+	case other != 0:
+		record(name, fmt.Errorf("%d unexpected statuses", other))
+	case ok != targets:
+		record(name, fmt.Errorf("successful samples = %d, want %d", ok, targets))
+	case conflict != extras:
+		record(name, fmt.Errorf("conflicts = %d, want %d", conflict, extras))
+	case completedViews != 1:
+		record(name, fmt.Errorf("COMPLETED views = %d, want exactly 1", completedViews))
+	case len(final.Samples) != targets:
+		record(name, fmt.Errorf("final samples = %d, want %d", len(final.Samples), targets))
+	default:
+		seenIDs := make(map[string]bool)
+		seenNodes := make(map[int64]bool)
+		for _, s := range final.Samples {
+			seenIDs[s.SampleID] = true
+			seenNodes[s.Node] = true
+		}
+		missing := 0
+		for node := int64(1); node <= targets; node++ {
+			if !seenNodes[node] {
+				missing++
+			}
+		}
+		switch {
+		case len(seenIDs) != targets || len(seenNodes) != targets || missing != 0:
+			record(name, fmt.Errorf("final samples not duplicate-free/complete: ids=%d nodes=%d missing=%d",
+				len(seenIDs), len(seenNodes), missing))
+		case final.Conclusion != "contaminated":
+			record(name, fmt.Errorf("conclusion = %s, want contaminated", final.Conclusion))
+		default:
+			pass(fmt.Sprintf("%s (%d ok, %d conflicts, concluded once, %d samples)",
+				name, ok, conflict, len(final.Samples)))
+		}
+	}
+}
+
+// checkInvestigationConcurrentLastTarget: many clients race to sample the
+// single remaining target; exactly one may succeed and conclude the
+// investigation.
+func checkInvestigationConcurrentLastTarget() {
+	name := "concurrent race for the last target"
+	view, err := createInvestigation([]byte(
+		`{"n":3,"edges":[{"from":0,"to":1},{"from":0,"to":2}],"inlets":[0]}`))
+	if err != nil {
+		record(name, err)
+		return
+	}
+	if _, _, _, err := postSample(view.ID, sampleBody("first", 1, "clean")); err != nil {
+		record(name, err)
+		return
+	}
+
+	const racers = 8
+	results := make(chan int, racers)
+	var wg sync.WaitGroup
+	for i := 0; i < racers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			status, _, _, err := postSample(view.ID, sampleBody(fmt.Sprintf("racer-%d", i), 2, "clean"))
+			if err != nil {
+				record(name, err)
+				results <- -1
+				return
+			}
+			results <- status
+		}(i)
+	}
+	wg.Wait()
+	close(results)
+
+	var ok, conflict, other int
+	for status := range results {
+		switch status {
+		case http.StatusOK:
+			ok++
+		case http.StatusConflict:
+			conflict++
+		default:
+			other++
+		}
+	}
+	switch {
+	case other != 0:
+		record(name, fmt.Errorf("%d unexpected statuses", other))
+	case ok != 1 || conflict != racers-1:
+		record(name, fmt.Errorf("ok = %d, conflicts = %d, want 1 and %d", ok, conflict, racers-1))
+	default:
+		pass(fmt.Sprintf("%s (1 winner, %d conflicts)", name, conflict))
+	}
 }

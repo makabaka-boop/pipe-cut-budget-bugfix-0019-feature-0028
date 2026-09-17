@@ -4,6 +4,8 @@
 
 本服务将该问题建模为有向图上的**多源多汇最小割**，通过自实现的最高标号推进-重标号（push-relabel）最大流算法求解（最大流 = 最小割，未使用任何外部求解器，也不枚举割集），以 HTTP API 提供计算结果。
 
+此外，服务还提供**污染采样调查（investigations）**：对暴雨后的管网做快照，迭代遍历确定污染入口可达的采样目标，并跟踪采样进度直到结案。
+
 ## 快速开始
 
 ```bash
@@ -62,6 +64,57 @@ curl -s -X POST http://localhost:8080/minimum-shutdown-cost \
 
 `GET /healthz` → `200 {"status":"ok"}`
 
+### `POST /investigations`
+
+为暴雨后的管网创建一次污染采样调查。请求体保存**节点、有向边和污染入口（inlets）快照**（节点编号 `0` 至 `n-1`）：
+
+```json
+{
+  "n": 4,
+  "edges": [{"from": 0, "to": 1}, {"from": 1, "to": 2}],
+  "inlets": [0]
+}
+```
+
+创建时服务以**迭代遍历**求出所有从任一入口可达的节点作为采样目标（`targets`），**排除入口自身**；环、自环和平行边不会产生重复目标。约束：`1 ≤ n ≤ 20000`，`edges` 至多 `100000` 条（`from`/`to` 须在 `[0, n-1]` 内），`inlets` 为非空节点数组（重复入口自动去重）。
+
+成功响应 `201 Created`，返回完整调查视图：
+
+```json
+{
+  "id": "1",
+  "status": "PENDING",
+  "conclusion": "clean",
+  "snapshot": {"n": 4, "edges": [{"from": 0, "to": 1}, {"from": 1, "to": 2}], "inlets": [0]},
+  "targets": [1, 2],
+  "samples": [],
+  "created_at": "2026-09-17T12:00:00Z"
+}
+```
+
+生命周期：`PENDING`（无样本）→ `IN_PROGRESS`（部分采样）→ `COMPLETED`（全部采齐），**终态不回退**；无目标时创建即为 `COMPLETED`。结论（`conclusion`）：任一样本为 `contaminated` 则为 `contaminated`，否则为 `clean`。
+
+### `POST /investigations/{id}/samples`
+
+登记一个水样。样本含**全局唯一**的 `sample_id`（跨所有调查唯一）、采样节点和结果（`clean` / `contaminated`）：
+
+```json
+{"sample_id": "s-1", "node": 1, "result": "contaminated"}
+```
+
+成功响应 `200 OK`，同样返回完整调查视图。仓储在**同一临界区**内登记样本并推进状态：并发补齐目标时记录不重不漏，且调查只结案一次。
+
+错误（均保持 `{"error": {"code", "message"}}` 结构）：
+
+| 情况 | 状态码 | `code` |
+| --- | --- | --- |
+| 请求体非法（JSON 错误、字段缺失/越界、`result` 非 clean/contaminated 等），不留痕 | 422 | `invalid_json` / `invalid_graph` / `invalid_sample` |
+| 调查不存在 | 404 | `not_found` |
+| `sample_id` 重复 | 409 | `duplicate_sample_id` |
+| 节点已被采样 | 409 | `node_already_sampled` |
+| 节点不是该调查的目标 | 409 | `node_not_target` |
+| 调查已结案（终态写入） | 409 | `investigation_completed` |
+
 ## 优雅停机
 
 收到 `SIGTERM` 或 `SIGINT` 后，服务会立即关闭监听器（拒绝新请求），随后调用 HTTP Server 的 `Shutdown` 等待已有请求完成并写完响应。排空窗口由 `SHUTDOWN_TIMEOUT`（Go duration，默认 `15s`）控制：
@@ -103,7 +156,8 @@ Compose 的 `stop_grace_period` 为 `20s`，略大于应用排空超时，确保
 ```
 cmd/server/       API 服务入口（PORT 环境变量，默认 8080）
 cmd/verify/       一次性验收客户端（API_URL 指向被测服务）
-internal/api/     HTTP 层：请求校验（422 稳定错误结构）+ 建图求解
+internal/api/     HTTP 层：请求校验（422/404/409 稳定错误结构）+ 建图求解 + 调查接口
+internal/investigation/ 调查领域层：目标推导（迭代遍历）与仓储（单临界区登记样本并推进状态）
 internal/maxflow/ 自实现最大流/最小割（push-relabel，64 位容量）
 Dockerfile        多阶段：runtime（API）与 verify（验收）
 docker-compose.yml  api 服务（API_PORT 控制宿主端口）+ verify 一次性服务
@@ -111,7 +165,8 @@ docker-compose.yml  api 服务（API_PORT 控制宿主端口）+ verify 一次�
 
 ## 验收内容（verify 服务）
 
-- `go test ./...`：最大流正确性（含与独立 Edmonds-Karp 实现的对拍）、API 校验与精确结果。
+- `go test ./...`：最大流正确性（含与独立 Edmonds-Karp 实现的对拍）、API 校验与精确结果、调查生命周期与并发仓储（`-race` 可通过）、优雅停机。
 - 真实 HTTP 调用：平行边、自环、多源多汇、无通路为 0、64 位成本等精确代价。
 - 非法输入：全部返回 422 且错误结构一致，不进入求解。
 - 大图：20000 节点 / 100000 边、答案构造可知，在 10 秒请求超时内核对精确值。
+- 调查接口：目标集合推导（环/自环/平行边去重、排除入口）、PENDING→IN_PROGRESS→COMPLETED 生命周期、contaminated/clean 结论、无目标即结案、422/404/409 错误结构、并发采样记录不重不漏且只结案一次。

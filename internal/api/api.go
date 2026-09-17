@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 
+	"raincut/internal/investigation"
 	"raincut/internal/maxflow"
 )
 
@@ -59,6 +60,10 @@ func New() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /minimum-shutdown-cost", handleMinimumShutdownCost)
 	mux.HandleFunc("GET /healthz", handleHealthz)
+
+	investigations := investigation.NewStore()
+	mux.HandleFunc("POST /investigations", handleCreateInvestigation(investigations))
+	mux.HandleFunc("POST /investigations/{id}/samples", handleAddSample(investigations))
 	return mux
 }
 
@@ -73,16 +78,16 @@ func handleMinimumShutdownCost(w http.ResponseWriter, r *http.Request) {
 
 	var req Request
 	if err := dec.Decode(&req); err != nil {
-		writeError(w, "invalid_json",
+		writeError(w, http.StatusUnprocessableEntity, "invalid_json",
 			"body must be one JSON object with fields n, edges, sources, sinks: "+err.Error())
 		return
 	}
 	if dec.More() {
-		writeError(w, "invalid_json", "unexpected data after the JSON document")
+		writeError(w, http.StatusUnprocessableEntity, "invalid_json", "unexpected data after the JSON document")
 		return
 	}
 	if msg := validate(&req); msg != "" {
-		writeError(w, "invalid_graph", msg)
+		writeError(w, http.StatusUnprocessableEntity, "invalid_graph", msg)
 		return
 	}
 
@@ -172,9 +177,11 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 	_ = json.NewEncoder(w).Encode(body)
 }
 
-func writeError(w http.ResponseWriter, code, message string) {
+// writeError sends the stable error envelope {"error": {"code", "message"}}
+// with the given HTTP status.
+func writeError(w http.ResponseWriter, status int, code, message string) {
 	var body errorResponse
 	body.Error.Code = code
 	body.Error.Message = message
-	writeJSON(w, http.StatusUnprocessableEntity, body)
+	writeJSON(w, status, body)
 }
