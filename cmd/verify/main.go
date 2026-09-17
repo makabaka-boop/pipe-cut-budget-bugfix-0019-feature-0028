@@ -112,6 +112,9 @@ func main() {
 	fmt.Println("== 20000 nodes / 100000 edges within a 10s request timeout ==")
 	checkLarge()
 
+	fmt.Println("== pollution sampling investigations ==")
+	checkInvestigations()
+
 	fmt.Println()
 	if failures > 0 {
 		fmt.Printf("VERIFY FAILED: %d check(s) failed\n", failures)
@@ -140,17 +143,22 @@ func waitReady() {
 	}
 }
 
-// post sends body to the endpoint with the given timeout and returns the
-// status code plus the decoded JSON document.
+// post sends body to /minimum-shutdown-cost with the given timeout and
+// returns the status code plus the decoded JSON document.
 func post(timeout time.Duration, body []byte) (int, map[string]json.RawMessage, time.Duration, error) {
+	return postPath(http.MethodPost, "/minimum-shutdown-cost", timeout, body)
+}
+
+// postPath sends body to an arbitrary API path.
+func postPath(method, path string, timeout time.Duration, body []byte) (int, map[string]json.RawMessage, time.Duration, error) {
 	client := &http.Client{Timeout: timeout}
 	start := time.Now()
-	resp, err := http.NewRequest(http.MethodPost, apiURL+"/minimum-shutdown-cost", bytes.NewReader(body))
+	req, err := http.NewRequest(method, apiURL+path, bytes.NewReader(body))
 	if err != nil {
 		return 0, nil, 0, err
 	}
-	resp.Header.Set("Content-Type", "application/json")
-	res, err := client.Do(resp)
+	req.Header.Set("Content-Type", "application/json")
+	res, err := client.Do(req)
 	elapsed := time.Since(start)
 	if err != nil {
 		return 0, nil, elapsed, err

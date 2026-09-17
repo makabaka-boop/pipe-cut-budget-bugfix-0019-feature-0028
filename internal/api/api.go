@@ -58,6 +58,8 @@ type errorResponse struct {
 func New() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /minimum-shutdown-cost", handleMinimumShutdownCost)
+	mux.HandleFunc("POST /investigations", handleCreateInvestigation)
+	mux.HandleFunc("POST /investigations/{id}/samples", handleAddSample)
 	mux.HandleFunc("GET /healthz", handleHealthz)
 	return mux
 }
@@ -173,8 +175,15 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 }
 
 func writeError(w http.ResponseWriter, code, message string) {
+	writeErrorStatus(w, http.StatusUnprocessableEntity, code, message)
+}
+
+// writeErrorStatus emits the same stable {"error": {"code", "message"}}
+// envelope as writeError, but with an arbitrary status (404/409 for the
+// investigation endpoints).
+func writeErrorStatus(w http.ResponseWriter, status int, code, message string) {
 	var body errorResponse
 	body.Error.Code = code
 	body.Error.Message = message
-	writeJSON(w, http.StatusUnprocessableEntity, body)
+	writeJSON(w, status, body)
 }

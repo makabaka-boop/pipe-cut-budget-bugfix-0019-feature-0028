@@ -58,6 +58,82 @@ curl -s -X POST http://localhost:8080/minimum-shutdown-cost \
 
 上例中两条 `0→1` 平行边须各自计费（3+4=7），优于切断 `1→2`（10）。
 
+### `POST /investigations`
+
+暴雨后对供水管网发起一次**污染采样调查**。创建时服务会快照节点、有向管道与污染入口，并以迭代遍历（显式队列，不递归）求出**从任一入口沿有向边可达、且不是入口自身**的全部节点，作为采样目标 `targets`：
+
+- 环、自环、平行边不会让任何目标重复；有向边方向被严格遵守；
+- 多个入口可达的同一节点只出现一次；入口即使经环回边可达自身/彼此，也永远不是目标。
+
+```json
+{
+  "n": 6,
+  "edges": [
+    {"from": 0, "to": 2},
+    {"from": 1, "to": 2},
+    {"from": 2, "to": 3},
+    {"from": 3, "to": 4},
+    {"from": 3, "to": 5}
+  ],
+  "sources": [0, 1]
+}
+```
+
+成功响应 `201 Created` 返回**完整调查视图**：
+
+```json
+{
+  "id": "inv_35abedcead5de2abf4c675defe3f8d1e",
+  "n": 6,
+  "edges": [{"from": 0, "to": 2}, {"from": 1, "to": 2}, {"from": 2, "to": 3}, {"from": 3, "to": 4}, {"from": 3, "to": 5}],
+  "sources": [0, 1],
+  "targets": [2, 3, 4, 5],
+  "status": "PENDING",
+  "result": null,
+  "samples": []
+}
+```
+
+`status` 单调推进、终态不回退：
+
+| 状态 | 含义 |
+| --- | --- |
+| `PENDING` | 尚无样本 |
+| `IN_PROGRESS` | 已登记部分目标的样本 |
+| `COMPLETED` | 全部目标已采样；终态，不再接受写入 |
+
+- **无可达目标**时调查创建即 `COMPLETED`，且 `result` 为 `"clean"`；
+- 结案时只要有任一样本是 `contaminated`，`result` 即为 `"contaminated"`，否则为 `"clean"`；调查未结案时 `result` 为 `null`。
+
+调查输入约束：`n` 为 `2..20000` 的整数；`edges` 至多 `100000` 条，端点必须在 `[0, n-1]` 内（边无成本字段，自环/平行边合法）；`sources` 非空、节点合法且不重复。
+
+### `POST /investigations/{id}/samples`
+
+对指定调查登记一个水样并推进状态。请求体：
+
+```json
+{"sample_id": "sample-0001", "node": 2, "result": "clean"}
+```
+
+- `sample_id`：非空字符串，在**所有调查之间全局唯一**；
+- `node`：必须是本调查的采样目标节点；
+- `result`：`"clean"` 或 `"contaminated"`。
+
+成功响应同样是 `201 Created` 与**完整调查视图**（样本按目标节点升序返回）。
+
+错误矩阵（响应体均为 `{"error": {"code", "message"}}`）：
+
+| 情况 | 状态码 |
+| --- | --- |
+| 请求不是合法 JSON、字段缺失/类型错误、`node` 越界、`result` 非法等 | **422**（不留任何痕迹） |
+| 调查 `id` 不存在 | **404** |
+| `sample_id` 已被使用（含其他调查） | **409** |
+| `node` 已在本调查采过样 | **409** |
+| `node` 不是采样目标（如入口本身、不可达节点） | **409** |
+| 调查已 `COMPLETED` 后再写入 | **409**（终态不回退） |
+
+并发说明：样本登记与状态推进在仓储的**同一临界区**内完成。多个请求并发补齐剩余目标时，每个目标恰好记录一次（不重不漏），且调查恰好结案一次；竞争失败的请求得到 409。
+
 ### 健康检查
 
 `GET /healthz` → `200 {"status":"ok"}`
@@ -101,17 +177,22 @@ Compose 的 `stop_grace_period` 为 `20s`，略大于应用排空超时，确保
 ## 项目结构
 
 ```
-cmd/server/       API 服务入口（PORT 环境变量，默认 8080）
-cmd/verify/       一次性验收客户端（API_URL 指向被测服务）
-internal/api/     HTTP 层：请求校验（422 稳定错误结构）+ 建图求解
-internal/maxflow/ 自实现最大流/最小割（push-relabel，64 位容量）
-Dockerfile        多阶段：runtime（API）与 verify（验收）
-docker-compose.yml  api 服务（API_PORT 控制宿主端口）+ verify 一次性服务
+cmd/server/          API 服务入口（PORT 环境变量，默认 8080）
+cmd/verify/          一次性验收客户端（API_URL 指向被测服务）
+internal/api/        HTTP 层：成本接口校验 + 调查路由（422/404/409 稳定错误结构）
+internal/investigation/ 调查领域层：入口可达目标解析、单调生命周期、并发安全仓储
+internal/maxflow/    自实现最大流/最小割（push-relabel，64 位容量）
+Dockerfile           多阶段：runtime（API）与 verify（验收）
+docker-compose.yml   api 服务（API_PORT 控制宿主端口）+ verify 一次性服务
 ```
 
 ## 验收内容（verify 服务）
 
-- `go test ./...`：最大流正确性（含与独立 Edmonds-Karp 实现的对拍）、API 校验与精确结果。
-- 真实 HTTP 调用：平行边、自环、多源多汇、无通路为 0、64 位成本等精确代价。
+- `go test ./...`：最大流正确性（含与独立 Edmonds-Karp 实现的对拍）、API 校验与精确结果、调查领域层与 HTTP 层（目标集合、生命周期、结论、错误矩阵、并发竞态）。
+- 真实 HTTP 调用：
+  - 最小关管成本：平行边、自环、多源多汇、无通路为 0、64 位成本等精确代价；
+  - 调查：含环/自环/平行边图的可达目标集合、无目标创建即完成、PENDING→IN_PROGRESS→COMPLETED 生命周期与 clean/contaminated 结论；
+  - 调查错误：非法输入 422 且不留痕、未知调查 404、重复编号/重复节点/非目标节点/终态写入 409，错误结构一致；
+  - 并发现场：多客户端同时补齐 50 个目标，记录数不重不漏且恰好结案一次；同编号同节点竞态只有一个 201。
 - 非法输入：全部返回 422 且错误结构一致，不进入求解。
 - 大图：20000 节点 / 100000 边、答案构造可知，在 10 秒请求超时内核对精确值。
